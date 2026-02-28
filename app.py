@@ -1,132 +1,122 @@
-import os
 import streamlit as st
-from dotenv import load_dotenv
+import datetime
+import wikipedia
+import operator
+from typing import TypedDict, Annotated, Sequence
 
-from typing import TypedDict, List
+from langchain_core.messages import BaseMessage, HumanMessage, AIMessage
+from langchain_community.chat_models import ChatOllama
+from langchain.tools import tool
+from langchain.tools.python.tool import PythonREPLTool
 from langgraph.graph import StateGraph, END
-
-from langchain_ollama import ChatOllama
-from langchain_tavily import TavilySearch
-from langchain_core.messages import HumanMessage, AIMessage, SystemMessage
-
-# Load env
-load_dotenv()
-
-# Initialize LLM
-llm = ChatOllama(model="llama3", temperature=0.3)
-
-# Initialize Search
-search_tool = TavilySearch(max_results=5)
-
-# ----------------------------
-# 1️⃣ Define Graph State
-# ----------------------------
-
-class GraphState(TypedDict):
-    messages: List
-    use_search: bool
+from langgraph.prebuilt import ToolNode
 
 
-# ----------------------------
-# 2️⃣ Router Node
-# ----------------------------
-
-def router(state: GraphState):
-    last_message = state["messages"][-1].content
-    keywords = ["latest", "news", "recent", "2025", "2026", "current"]
-
-    use_search = any(word in last_message.lower() for word in keywords)
-
-    return {"use_search": use_search}
+st.set_page_config(page_title="LangGraph + Ollama (5 Tools)")
+st.title("🤖 LangGraph Agent with 5 Tools (Ollama Local)")
 
 
-# ----------------------------
-# 3️⃣ Search Node
-# ----------------------------
-
-def search_node(state: GraphState):
-    query = state["messages"][-1].content
-    results = search_tool.invoke(query)
-
-    enriched_prompt = f"""
-    Use the following web results to answer:
-
-    {results}
-
-    Question: {query}
-    """
-
-    state["messages"].append(HumanMessage(content=enriched_prompt))
-    return state
-
-
-# ----------------------------
-# 4️⃣ LLM Node
-# ----------------------------
-
-def llm_node(state: GraphState):
-    response = llm.invoke(state["messages"])
-    state["messages"].append(AIMessage(content=response.content))
-    return state
-
-
-# ----------------------------
-# 5️⃣ Build Graph
-# ----------------------------
-
-graph = StateGraph(GraphState)
-
-graph.add_node("router", router)
-graph.add_node("search", search_node)
-graph.add_node("llm", llm_node)
-
-graph.set_entry_point("router")
-
-graph.add_conditional_edges(
-    "router",
-    lambda state: "search" if state["use_search"] else "llm",
+llm = ChatOllama(
+    model="llama3",
+    temperature=0
 )
 
-graph.add_edge("search", "llm")
-graph.add_edge("llm", END)
-
-app_graph = graph.compile()
 
 
-# ----------------------------
-# 6️⃣ Streamlit UI
-# ----------------------------
+def calculator(expression: str) -> str:
+    """Evaluate a mathematical expression."""
+    try:
+        return str(eval(expression))
+    except Exception as e:
+        return f"Error: {e}"
 
-st.set_page_config(page_title="LangGraph Research Assistant")
-st.title("🤖 LangGraph Research Assistant")
+
+def wiki_search(query: str) -> str:
+    """Search Wikipedia for a topic."""
+    try:
+        return wikipedia.summary(query, sentences=3)
+    except:
+        return "No results found."
+
+
+def current_datetime(_: str) -> str:
+    """Get current date and time."""
+    return str(datetime.datetime.now())
+
+
+def read_text_file(file_path: str) -> str:
+    """Read content from a text file."""
+    try:
+        with open(file_path, "r") as f:
+            return f.read()
+    except:
+        return "Could not read file."
+
+python_tool = PythonREPLTool()
+
+tools = [
+    calculator,
+    wiki_search,
+    current_datetime,
+    read_text_file,
+    python_tool
+]
+
+tool_node = ToolNode(tools)
+
+
+
+class AgentState(TypedDict):
+    messages: Annotated[Sequence[BaseMessage], operator.add]
+
+
+
+def call_model(state):
+    response = llm.bind_tools(tools).invoke(state["messages"])
+    return {"messages": [response]}
+
+
+
+def should_continue(state):
+    last_message = state["messages"][-1]
+    if isinstance(last_message, AIMessage) and last_message.tool_calls:
+        return "tools"
+    return END
+
+workflow = StateGraph(AgentState)
+
+workflow.add_node("agent", call_model)
+workflow.add_node("tools", tool_node)
+
+workflow.set_entry_point("agent")
+
+workflow.add_conditional_edges(
+    "agent",
+    should_continue,
+)
+
+workflow.add_edge("tools", "agent")
+
+graph = workflow.compile()
+
 
 if "messages" not in st.session_state:
-    st.session_state.messages = [
-        SystemMessage(content="You are a helpful research assistant.")
-    ]
+    st.session_state.messages = []
 
-# Display history
-for msg in st.session_state.messages:
-    if isinstance(msg, HumanMessage):
-        with st.chat_message("user"):
-            st.markdown(msg.content)
-    elif isinstance(msg, AIMessage):
-        with st.chat_message("assistant"):
-            st.markdown(msg.content)
+user_input = st.chat_input("Ask something...")
 
-# Chat input
-if prompt := st.chat_input("Ask something..."):
-    with st.chat_message("user"):
-        st.markdown(prompt)
+if user_input:
+    st.session_state.messages.append(HumanMessage(content=user_input))
 
-    st.session_state.messages.append(HumanMessage(content=prompt))
-
-    result = app_graph.invoke({
-        "messages": st.session_state.messages,
-        "use_search": False
+    result = graph.invoke({
+        "messages": st.session_state.messages
     })
 
     st.session_state.messages = result["messages"]
 
-    with st.chat_message("assistant"):
-        st.markdown(st.session_state.messages[-1].content)
+# Display Chat
+for msg in st.session_state.messages:
+    if msg.type == "human":
+        st.chat_message("user").write(msg.content)
+    else:
+        st.chat_message("assistant").write(msg.content)
